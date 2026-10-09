@@ -145,11 +145,16 @@ async def predict(file: UploadFile = File(...)):
         async with prediction_lock:
             raw_output = session.run([output_name], {input_name: processed_image})
 
-        raw = np.array(raw_output[0][0])
+        raw = np.asarray(raw_output[0][0], dtype=np.float64)
 
-        # Manual softmax in case the model outputs unnormalized logits
-        exp = np.exp(raw - np.max(raw))
-        preds = exp / exp.sum()
+        # The model's final Dense layer already uses softmax, so `raw` is
+        # normally a probability vector. Only apply softmax if the output
+        # does not sum to ~1.0 (i.e. unnormalized logits).
+        if 0.98 <= float(np.sum(raw)) <= 1.02:
+            preds = raw
+        else:
+            exp = np.exp(raw - np.max(raw))
+            preds = exp / exp.sum()
 
         predicted_index = int(np.argmax(preds))
         confidence = float(preds[predicted_index])
