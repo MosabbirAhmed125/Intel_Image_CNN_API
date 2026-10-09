@@ -1,21 +1,18 @@
-import os
-
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-
 import asyncio
 import gc
 import json
+import os
 from io import BytesIO
 
 import numpy as np
-import tensorflow as tf
+import onnxruntime as ort
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-MODEL_PATH = os.path.join(BASE_DIR, "intel_cnn_model.keras")
+MODEL_PATH = os.path.join(BASE_DIR, "intel_cnn_model.onnx")
 CLASS_NAMES_PATH = os.path.join(BASE_DIR, "class_names.json")
 
 IMG_SIZE = (150, 150)
@@ -30,7 +27,20 @@ if not os.path.exists(MODEL_PATH):
 if not os.path.exists(CLASS_NAMES_PATH):
     raise FileNotFoundError(f"Class names file not found at: {CLASS_NAMES_PATH}")
 
-model = tf.keras.models.load_model(MODEL_PATH)
+# --- ONNX Runtime session (single-thread, CPU only) ---
+session_options = ort.SessionOptions()
+session_options.intra_op_num_threads = 1
+session_options.inter_op_num_threads = 1
+session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+session = ort.InferenceSession(
+    MODEL_PATH,
+    sess_options=session_options,
+    providers=["CPUExecutionProvider"],
+)
+
+input_name = session.get_inputs()[0].name
+output_name = session.get_outputs()[0].name
 
 with open(CLASS_NAMES_PATH, "r") as f:
     class_names = json.load(f)
@@ -39,8 +49,8 @@ prediction_lock = asyncio.Lock()
 
 app = FastAPI(
     title="Intel Image Classification API",
-    description="CNN image classifier for glacier, sea, forest, and street images.",
-    version="1.0.0",
+    description="CNN image classifier for buildings, forest, glacier, mountain, sea, and street images.",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -57,6 +67,7 @@ app.add_middleware(
 
 
 def preprocess_image(image_bytes: bytes):
+    """Validate, resize to 150×150, normalise to [0, 1] float32, return (1, 150, 150, 3)."""
     try:
         image = Image.open(BytesIO(image_bytes))
         image.verify()
@@ -89,6 +100,7 @@ def preprocess_image(image_bytes: bytes):
 @app.get("/")
 def root():
     return {
+        "status": "running",
         "message": "Intel Image Classification API is running.",
         "classes": class_names,
     }
@@ -131,14 +143,20 @@ async def predict(file: UploadFile = File(...)):
 
     try:
         async with prediction_lock:
-            predictions = model.predict(processed_image, verbose=0)
+            raw_output = session.run([output_name], {input_name: processed_image})
 
-        predicted_index = int(np.argmax(predictions[0]))
-        confidence = float(np.max(predictions[0]))
+        raw = np.array(raw_output[0][0])
+
+        # Manual softmax in case the model outputs unnormalized logits
+        exp = np.exp(raw - np.max(raw))
+        preds = exp / exp.sum()
+
+        predicted_index = int(np.argmax(preds))
+        confidence = float(preds[predicted_index])
         predicted_class = class_names[predicted_index]
 
         all_predictions = {
-            class_names[i]: round(float(predictions[0][i]), 4)
+            class_names[i]: round(float(preds[i]), 4)
             for i in range(len(class_names))
         }
 
@@ -151,6 +169,6 @@ async def predict(file: UploadFile = File(...)):
     finally:
         del image_bytes
         del processed_image
-        if "predictions" in locals():
-            del predictions
+        if "raw_output" in locals():
+            del raw_output
         gc.collect()

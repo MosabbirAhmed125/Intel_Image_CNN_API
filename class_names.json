@@ -1,1 +1,8 @@
-["forest", "glacier", "sea", "street"]
+[
+  "buildings",
+  "forest",
+  "glacier",
+  "mountain",
+  "sea",
+  "street"
+]
